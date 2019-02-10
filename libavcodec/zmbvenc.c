@@ -55,20 +55,18 @@ typedef struct ZmbvEncContext {
     int keyint, curfrm;
     z_stream zstream;
 
-    int score_tab[ZMBV_BLOCK * ZMBV_BLOCK + 1];
+    int score_tab[2 * ZMBV_BLOCK * ZMBV_BLOCK + 1];
 } ZmbvEncContext;
 
-
-/** Block comparing function
- * XXX should be optimized and moved to DSPContext
+/** Block histogram generating function
+ * XORs all the bytes in all the blocks and counts the occurence of each
+ * resulting value
  */
-static inline int block_cmp(ZmbvEncContext *c, uint8_t *src, int stride,
+static inline void block_histogram(ZmbvEncContext *c, uint8_t *src, int stride,
                             uint8_t *src2, int stride2, int bw, int bh,
-                            int *xored)
-{
-    int sum = 0;
+                            int *xored, uint16_t *histogram) {
     int i, j;
-    uint16_t histogram[256] = {0};
+    memset(histogram, 0, 256*sizeof(histogram[0]));
 
     /* Build frequency histogram of byte values for src[] ^ src2[] */
     for(j = 0; j < bh; j++){
@@ -83,12 +81,27 @@ static inline int block_cmp(ZmbvEncContext *c, uint8_t *src, int stride,
     /* If not all the xored values were 0, then the blocks are different */
     *xored = (histogram[0] < bw * bh);
 
+}
+
+/** Block comparing function
+ * XXX should be optimized and moved to DSPContext
+ */
+static inline int block_cmp(ZmbvEncContext *c, uint8_t *src, int stride,
+                            uint8_t *src2, int stride2, int bw, int bh,
+                            int *xored, uint16_t * const prev_histogram)
+{
+    int i;
+    unsigned int sum = 0;
+    uint16_t histogram[256] = {0};
+
+    block_histogram(c, src, stride, src2, stride2, bw, bh, xored, histogram);
+
     /* Exit early if blocks are equal */
     if (!*xored) return 0;
 
     /* Sum the entropy of all values */
     for(i = 0; i < 256; i++)
-        sum += c->score_tab[histogram[i]];
+        sum += c->score_tab[histogram[i] + prev_histogram[i]];
 
     return sum;
 }
@@ -97,24 +110,26 @@ static inline int block_cmp(ZmbvEncContext *c, uint8_t *src, int stride,
  * TODO make better ME decisions
  */
 static int zmbv_me(ZmbvEncContext *c, uint8_t *src, int sstride, uint8_t *prev,
-                   int pstride, int x, int y, int *mx, int *my, int *xored)
+                   int pstride, int x, int y, int *mx, int *my, int *xored, uint16_t * const prev_histogram)
 {
     int dx, dy, txored, tv, bv, bw, bh;
     int mx0, my0;
 
     mx0 = *mx;
     my0 = *my;
+
+    *mx = *my = 0;
     bw = FFMIN(ZMBV_BLOCK, c->avctx->width - x);
     bh = FFMIN(ZMBV_BLOCK, c->avctx->height - y);
 
     /* Try (0,0) */
-    bv = block_cmp(c, src, sstride, prev, pstride, bw, bh, xored);
+    bv = block_cmp(c, src, sstride, prev, pstride, bw, bh, xored, prev_histogram);
     *mx = *my = 0;
     if(!bv) return 0;
 
     /* Try previous block's MV (if not 0,0) */
     if (mx0 || my0){
-        tv = block_cmp(c, src, sstride, prev + mx0 + my0 * pstride, pstride, bw, bh, &txored);
+        tv = block_cmp(c, src, sstride, prev + mx0 + my0 * pstride, pstride, bw, bh, &txored, prev_histogram);
         if(tv < bv){
             bv = tv;
             *mx = mx0;
@@ -129,7 +144,7 @@ static int zmbv_me(ZmbvEncContext *c, uint8_t *src, int sstride, uint8_t *prev,
         for(dx = -c->lrange; dx <= c->urange; dx++){
             if(!dx && !dy) continue; // we already tested this block
             if(dx == mx0 && dy == my0) continue; // this one too
-            tv = block_cmp(c, src, sstride, prev + dx + dy * pstride, pstride, bw, bh, &txored);
+            tv = block_cmp(c, src, sstride, prev + dx + dy * pstride, pstride, bw, bh, &txored, prev_histogram);
             if(tv < bv){
                  bv = tv;
                  *mx = dx;
@@ -154,6 +169,7 @@ static int encode_frame(AVCodecContext *avctx, AVPacket *pkt,
     int work_size = 0, pkt_size;
     int bw, bh;
     int i, j, ret;
+    uint16_t prev_histogram[256] = {0};
 
     keyframe = !c->curfrm;
     c->curfrm++;
@@ -209,13 +225,15 @@ FF_ENABLE_DEPRECATION_WARNINGS
         /* for now just XOR'ing */
         for(y = 0; y < avctx->height; y += ZMBV_BLOCK) {
             bh2 = FFMIN(avctx->height - y, ZMBV_BLOCK);
+            /* Don't use the prev histogram from the end of the last row */
+            memset(prev_histogram, 0, sizeof(prev_histogram));
             for(x = 0; x < avctx->width; x += ZMBV_BLOCK, mv += 2) {
                 bw2 = FFMIN(avctx->width - x, ZMBV_BLOCK);
 
                 tsrc = src + x;
                 tprev = prev + x;
 
-                zmbv_me(c, tsrc, p->linesize[0], tprev, c->pstride, x, y, &mx, &my, &xored);
+                zmbv_me(c, tsrc, p->linesize[0], tprev, c->pstride, x, y, &mx, &my, &xored, prev_histogram);
                 mv[0] = (mx << 1) | !!xored;
                 mv[1] = my << 1;
                 tprev += mx + my * c->pstride;
@@ -227,6 +245,8 @@ FF_ENABLE_DEPRECATION_WARNINGS
                         tprev += c->pstride;
                     }
                 }
+                /* Store the previous histogram to use with the next block */
+                block_histogram(c, src, p->linesize[0], prev + mx + my * c->pstride, c->pstride, bw, bh, &xored, prev_histogram);
             }
             src += p->linesize[0] * ZMBV_BLOCK;
             prev += c->pstride * ZMBV_BLOCK;
